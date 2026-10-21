@@ -105,22 +105,20 @@ func (p *MachineProvider) createMachine(ctx context.Context, req *driver.CreateM
 	imageName := providerSpec.ImageName
 	userDataBase64Enc := base64.StdEncoding.EncodeToString(userData)
 
-	image, _, err := client.Image.GetByName(ctx, imageName)
+	serverType, _, err := client.ServerType.GetByName(ctx, providerSpec.ServerType)
 	if err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
+	} else if serverType == nil {
+		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("Server type %s not found", providerSpec.ServerType))
 	}
 
-	if image == nil {
-		images, err := client.Image.AllWithOpts(ctx, hcloud.ImageListOpts{Name: imageName, IncludeDeprecated: true})
-		if err != nil {
-			return nil, status.Error(codes.Unavailable, err.Error())
-		}
-
-		if len(images) == 0 {
-			return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("Image %s not found", imageName))
-		} else {
-			image = images[0]
-		}
+	// Public images share a name across CPU architectures, so the lookup has to be
+	// narrowed to the server type's architecture (this also includes deprecated images).
+	image, _, err := client.Image.GetByNameAndArchitecture(ctx, imageName, serverType.Architecture)
+	if err != nil {
+		return nil, status.Error(codes.Unavailable, err.Error())
+	} else if image == nil {
+		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("Image %s not found for architecture %s", imageName, serverType.Architecture))
 	}
 
 	region := apis.GetRegionFromZone(providerSpec.Zone)
@@ -129,7 +127,7 @@ func (p *MachineProvider) createMachine(ctx context.Context, req *driver.CreateM
 
 	opts := hcloud.ServerCreateOpts{
 		Name:       machine.Name,
-		ServerType: &hcloud.ServerType{Name: providerSpec.ServerType},
+		ServerType: serverType,
 		Image:      image,
 		Labels: map[string]string{
 			"mcm.gardener.cloud/cluster":    providerSpec.Cluster,
@@ -342,7 +340,7 @@ func (p *MachineProvider) createMachineOnErrorCleanup(ctx context.Context, req *
 	if resultData.ServerID != 0 {
 		server, _, _ := client.Server.GetByID(ctx, resultData.ServerID)
 		if nil != server {
-			_, _ = client.Server.Delete(ctx, server)
+			_, _, _ = client.Server.DeleteWithResult(ctx, server)
 		}
 	}
 
@@ -398,7 +396,7 @@ func (p *MachineProvider) DeleteMachine(ctx context.Context, req *driver.DeleteM
 		return &driver.DeleteMachineResponse{}, nil
 	}
 
-	_, err = client.Server.Delete(ctx, server)
+	_, _, err = client.Server.DeleteWithResult(ctx, server)
 	if err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}

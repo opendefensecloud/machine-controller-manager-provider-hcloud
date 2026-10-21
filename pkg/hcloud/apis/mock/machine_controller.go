@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"sync/atomic"
 
@@ -71,10 +72,26 @@ func ServerDeleteHitCount() int32 {
 	return atomic.LoadInt32(&serverDeleteHits)
 }
 
+// createdServerImageID records the image ID sent in the most recent POST /servers
+// handled by SetupServersEndpointOnMux. Tests use it to assert which image variant
+// (e.g. x86 vs. arm) CreateMachine actually selected.
+var createdServerImageID int64
+
+// CreatedServerImageID returns the image ID sent in the most recent POST /servers.
+func CreatedServerImageID() int64 {
+	return atomic.LoadInt64(&createdServerImageID)
+}
+
+// TestImageID and TestArmImageID are the IDs of the x86 and arm variants of TestImageName.
 const (
-	jsonImageData = `
+	TestImageID    = 42
+	TestArmImageID = 43
+)
+
+const (
+	jsonImageDataTemplate = `
 {
-	"id": 42,
+	"id": %d,
 	"type": "snapshot",
 	"status": "available",
 	"name": "ubuntu-20.04",
@@ -88,6 +105,7 @@ const (
 	},
 	"os_flavor": "ubuntu",
 	"os_version": "20.04",
+	"architecture": "%s",
 	"rapid_deploy": false,
 	"protection": {
 		"delete": false
@@ -281,7 +299,16 @@ func NewMachineClassWithProviderSpec(providerSpec []byte) *v1alpha1.MachineClass
 // serverState string Server state to use
 func newJsonServerData(serverID int, serverState string) string {
 	testServerName := fmt.Sprintf(TestServerNameTemplate, serverID)
-	return fmt.Sprintf(jsonServerDataTemplate, serverID, testServerName, serverState, TestServerType, TestZone, jsonImageData)
+	return fmt.Sprintf(jsonServerDataTemplate, serverID, testServerName, serverState, TestServerType, TestZone, newJsonImageData(TestImageID, "x86"))
+}
+
+// newJsonImageData generates a JSON image data object for testing purposes.
+//
+// PARAMETERS
+// imageID      int    Image ID to use
+// architecture string CPU architecture of the image ("x86" or "arm")
+func newJsonImageData(imageID int, architecture string) string {
+	return fmt.Sprintf(jsonImageDataTemplate, imageID, architecture)
 }
 
 // SetupFloatingIPsEndpointOnMux configures a "/floating_ips" endpoint on the mux given.
@@ -304,7 +331,9 @@ func SetupFloatingIPsEndpointOnMux(mux *http.ServeMux) {
 	})
 }
 
-// SetupImagesEndpointOnMux configures a "/images" endpoint on the mux given.
+// SetupImagesEndpointOnMux configures a "/images" endpoint on the mux given. Like the
+// real API, TestImageName exists once per CPU architecture (x86 first, then arm) and
+// the "architecture" query parameter filters the list.
 //
 // PARAMETERS
 // mux *http.ServeMux Mux to add handler to
@@ -314,25 +343,58 @@ func SetupImagesEndpointOnMux(mux *http.ServeMux) {
 
 		res.WriteHeader(http.StatusOK)
 
-		if _, err := res.Write([]byte(`
-{
-	"images": [
-		`)); err != nil {
-			panic(err)
-		}
-
 		queryParams := req.URL.Query()
+		var images []string
 
 		if queryParams.Get("name") == TestImageName {
-			if _, err := res.Write([]byte(jsonImageData)); err != nil {
-				panic(err)
+			architectures := queryParams["architecture"]
+
+			if len(architectures) == 0 || slices.Contains(architectures, "x86") {
+				images = append(images, newJsonImageData(TestImageID, "x86"))
+			}
+			if len(architectures) == 0 || slices.Contains(architectures, "arm") {
+				images = append(images, newJsonImageData(TestArmImageID, "arm"))
 			}
 		}
 
-		if _, err := res.Write([]byte(`
-	]
+		if _, err := fmt.Fprintf(res, "{ \"images\": [ %s ] }", strings.Join(images, ",")); err != nil {
+			panic(err)
+		}
+	})
 }
-		`)); err != nil {
+
+// SetupServerTypesEndpointOnMux configures a "/server_types" endpoint on the mux given
+// that knows only TestServerType, with the given CPU architecture.
+//
+// PARAMETERS
+// mux          *http.ServeMux Mux to add handler to
+// architecture string         CPU architecture of TestServerType ("x86" or "arm")
+func SetupServerTypesEndpointOnMux(mux *http.ServeMux, architecture string) {
+	mux.HandleFunc("/server_types", func(res http.ResponseWriter, req *http.Request) {
+		res.Header().Add("Content-Type", "application/json; charset=utf-8")
+
+		res.WriteHeader(http.StatusOK)
+
+		serverType := ""
+
+		if req.URL.Query().Get("name") == TestServerType {
+			serverType = fmt.Sprintf(`
+{
+	"id": 1,
+	"name": "%s",
+	"description": "Test",
+	"cores": 1,
+	"memory": 1,
+	"disk": 25,
+	"prices": [],
+	"storage_type": "local",
+	"cpu_type": "shared",
+	"architecture": "%s"
+}
+			`, TestServerType, architecture)
+		}
+
+		if _, err := fmt.Fprintf(res, "{ \"server_types\": [ %s ] }", serverType); err != nil {
 			panic(err)
 		}
 	})
@@ -384,6 +446,10 @@ func SetupServersEndpointOnMux(mux *http.ServeMux, emptyOnFirstRequest bool) {
 			jsonErr := json.Unmarshal(jsonData, &data)
 			if jsonErr != nil {
 				panic(jsonErr)
+			}
+
+			if imageID, ok := data["image"].(float64); ok {
+				atomic.StoreInt64(&createdServerImageID, int64(imageID))
 			}
 
 			jsonServerData := newJsonServerData(TestServerID, "starting")
@@ -478,7 +544,7 @@ func SetupTestServerEndpointOnMux(mux *http.ServeMux) {
 		if strings.ToLower(req.Method) == "delete" {
 			atomic.AddInt32(&serverDeleteHits, 1)
 			res.WriteHeader(http.StatusOK)
-			res.Write([]byte(fmt.Sprintf("{ \"server\": %s }", newJsonServerData(TestServerID, "shutdown_server"))))
+			res.Write([]byte(fmt.Sprintf(`{ "action": { "id": 13, "command": "delete_server", "status": "running", "progress": 0, "resources": [ { "id": %d, "type": "server" } ] } }`, TestServerID)))
 		} else if strings.ToLower(req.Method) == "get" {
 			res.WriteHeader(http.StatusOK)
 			res.Write([]byte(fmt.Sprintf("{ \"server\": %s }", newJsonServerData(TestServerID, "running"))))

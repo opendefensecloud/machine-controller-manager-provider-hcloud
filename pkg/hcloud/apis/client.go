@@ -20,12 +20,18 @@ package apis
 import (
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/hetznercloud/hcloud-go/v2/hcloud"
 	"k8s.io/klog/v2"
+
+	"github.com/opendefensecloud/machine-controller-manager-provider-hcloud/pkg/version"
 )
 
-var singletons = make(map[string]*hcloud.Client)
+var (
+	singletons   = make(map[string]*hcloud.Client)
+	singletonsMu sync.Mutex
+)
 
 // GetClientForToken returns an underlying HCloud client for the given token.
 //
@@ -38,17 +44,21 @@ func GetClientForToken(token string) *hcloud.Client {
 		token = strings.ReplaceAll(token, "\n", "")
 	}
 
+	singletonsMu.Lock()
+	defer singletonsMu.Unlock()
+
 	client, ok := singletons[token]
 
 	if !ok {
 		opts := []hcloud.ClientOption{
 			hcloud.WithToken(token),
-			hcloud.WithApplication("machine-controller-manager-provider-hcloud", "v0.0.0"),
+			hcloud.WithApplication("machine-controller-manager-provider-hcloud", version.Version),
 		}
 		if endpoint := os.Getenv("HCLOUD_ENDPOINT"); endpoint != "" {
 			opts = append(opts, hcloud.WithEndpoint(endpoint))
 		}
 		client = hcloud.NewClient(opts...)
+		singletons[token] = client
 	}
 
 	return client
@@ -60,6 +70,9 @@ func GetClientForToken(token string) *hcloud.Client {
 // token  string         Token to look up client instance for
 // client *hcloud.Client Preconfigured HCloud client
 func SetClientForToken(token string, client *hcloud.Client) {
+	singletonsMu.Lock()
+	defer singletonsMu.Unlock()
+
 	if client == nil {
 		delete(singletons, token)
 	} else {
