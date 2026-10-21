@@ -56,6 +56,7 @@ var _ = Describe("MachineController", func() {
 		apis.SetClientForToken("dummy-token", mockTestEnv.Client)
 		mock.SetupFloatingIPsEndpointOnMux(mockTestEnv.Mux)
 		mock.SetupImagesEndpointOnMux(mockTestEnv.Mux)
+		mock.SetupServerTypesEndpointOnMux(mockTestEnv.Mux, "x86")
 		mock.SetupServersEndpointOnMux(mockTestEnv.Mux, true)
 		mock.SetupSshKeysEndpointOnMux(mockTestEnv.Mux)
 		mock.SetupTestPlacementGroupEndpointOnMux(mockTestEnv.Mux)
@@ -177,6 +178,62 @@ var _ = Describe("MachineController", func() {
 			Expect(mock.AddToPlacementGroupHitCount()).To(BeNumerically(">", 0), "expected add_to_placement_group action to be hit")
 		})
 
+		It("selects the image variant matching the server type's CPU architecture", func() {
+			ctx := context.Background()
+
+			env := mock.NewMockTestEnv()
+			defer env.Teardown()
+
+			const token = "arm-image-token"
+			apis.SetClientForToken(token, env.Client)
+			defer apis.SetClientForToken(token, nil)
+
+			// TestImageName exists for both x86 and arm, x86 listed first. Without filtering
+			// by the server type's architecture the x86 image wins and an arm server type is
+			// created with an image it cannot boot.
+			mock.SetupServerTypesEndpointOnMux(env.Mux, "arm")
+			mock.SetupImagesEndpointOnMux(env.Mux)
+			mock.SetupServersEndpointOnMux(env.Mux, true)
+			mock.SetupSshKeysEndpointOnMux(env.Mux)
+			mock.SetupFloatingIPsEndpointOnMux(env.Mux)
+			mock.SetupTestPlacementGroupEndpointOnMux(env.Mux)
+			mock.SetupTestServerEndpointOnMux(env.Mux)
+
+			secret := &corev1.Secret{
+				Data: map[string][]byte{
+					"token":    []byte(token),
+					"userData": []byte("dummy-user-data"),
+				},
+			}
+
+			_, err := provider.CreateMachine(ctx, &driver.CreateMachineRequest{
+				Machine:      mock.NewMachine(-1),
+				MachineClass: mock.NewMachineClass(),
+				Secret:       secret,
+			})
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(mock.CreatedServerImageID()).To(Equal(int64(mock.TestArmImageID)))
+		})
+
+		It("returns InvalidArgument when the server type does not exist", func() {
+			ctx := context.Background()
+
+			spec := []byte(`{"cluster":"xyz","zone":"hel1-dc2","imageName":"ubuntu-20.04","serverType":"does-not-exist","sshFingerprint":"00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff"}`)
+
+			_, err := provider.CreateMachine(ctx, &driver.CreateMachineRequest{
+				Machine:      mock.NewMachine(-1),
+				MachineClass: mock.NewMachineClassWithProviderSpec(spec),
+				Secret:       providerSecret,
+			})
+
+			Expect(err).To(HaveOccurred())
+
+			errStatus, ok := err.(*status.Status)
+			Expect(ok).To(BeTrue())
+			Expect(errStatus.Code()).To(Equal(codes.InvalidArgument))
+		})
+
 		It("does not delete a foreign server that merely shares a name (never deletes by name)", func() {
 			ctx := context.Background()
 
@@ -268,6 +325,7 @@ var _ = Describe("MachineController", func() {
 			defer apis.SetClientForToken(token, nil)
 
 			mock.SetupServersEndpointOnMux(env.Mux, true)
+			mock.SetupServerTypesEndpointOnMux(env.Mux, "x86")
 			env.Mux.HandleFunc("/images", func(res http.ResponseWriter, req *http.Request) {
 				res.WriteHeader(http.StatusInternalServerError)
 			})
@@ -303,6 +361,7 @@ var _ = Describe("MachineController", func() {
 			defer apis.SetClientForToken(token, nil)
 
 			mock.SetupServersEndpointOnMux(env.Mux, true)
+			mock.SetupServerTypesEndpointOnMux(env.Mux, "x86")
 			mock.SetupImagesEndpointOnMux(env.Mux)
 			env.Mux.HandleFunc("/ssh_keys", func(res http.ResponseWriter, req *http.Request) {
 				res.WriteHeader(http.StatusInternalServerError)
@@ -339,6 +398,7 @@ var _ = Describe("MachineController", func() {
 			defer apis.SetClientForToken(token, nil)
 
 			mock.SetupServersEndpointOnMux(env.Mux, true)
+			mock.SetupServerTypesEndpointOnMux(env.Mux, "x86")
 			mock.SetupImagesEndpointOnMux(env.Mux)
 			mock.SetupSshKeysEndpointOnMux(env.Mux)
 			env.Mux.HandleFunc("/networks", func(res http.ResponseWriter, req *http.Request) {
